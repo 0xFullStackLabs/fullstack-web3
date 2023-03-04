@@ -1,5 +1,6 @@
 {
-  "index": "简介",
+  "index": "前言",
+  "architecture": "Web3应用技术架构",
   "ethereum_smart_contract": "以太坊和智能合约",
   "frontend": "Web3前端开发",
   "oracle": "预言机",
