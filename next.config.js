@@ -6,7 +6,15 @@ const withNextra = require('nextra')({
   flexsearch: {
     codeblocks: true
   },
-  defaultShowCopyCode: true
+  defaultShowCopyCode: true,
+  latex: true
 })
 
-module.exports = withNextra()
+module.exports = withNextra(
+  {
+    i18n: {
+      locales: ['en', 'zh'],
+      defaultLocale: 'zh'
+    }
+  }
+)

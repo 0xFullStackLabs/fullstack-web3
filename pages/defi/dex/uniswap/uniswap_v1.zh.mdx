@@ -1,0 +1,110 @@
+# V1
+
+Uniswap V1 官方是用 vyper 实现的，为了方便大家学习，笔者写了一个 solidity 的版本，[uniswap-v1-in-solidity](https://github.com/ethaninmel/uniswap-v1-in-solidity)。
+
+通过之前的介绍我们知道，Uniswap 协议其实主要就是两部分，流动性管理以及价格计算，最后结合在一起实现了交易功能。接下来我们就通过合约代码来看具体是怎么做的。
+
+Uniswap V1 只有两个合约，Factory 和 Exchange。
+
+Factory 是用来生成并记录 Exchange 的，让我们可以通过代币地址找到 Exchange 地址。Exchange 则实现了交易逻辑。Exchange 就是流动池，每个（ETH-ERC20）交易对都是一个 Exchange，流动性就是注入到这里面。
+
+首先我们先来看工厂合约。
+
+## 工厂合约
+
+每一个新部署的 Exchange 都是通过 Factory 来注册的，主要 Uniswap V1 版本发布的时候还没有 create2，没法通过 token 地址计算出来对应的 Exchange 地址，所以只能通过这种方式来实现 Exchange 合约地址的查询。
+
+```solidity showLineNumbers filename="Factory.sol" {3,13-14,23-25}
+contract Factory is IFactory {
+    uint256 public tokenCount;
+    mapping(address => address) internal token_to_exchange;
+    mapping(address => address) internal exchange_to_token;
+    mapping(uint256 => address) internal id_to_token;
+
+    function createExchange(address token) external returns (address) {
+        require(token != address(0), "invalid token address");
+        require(
+            token_to_exchange[token] == address(0),
+            "exchange already exists"
+        );
+        Exchange exchange = new Exchange(token);
+        token_to_exchange[token] = address(exchange);
+        exchange_to_token[address(exchange)] = token;
+        uint256 token_id = tokenCount + 1;
+        tokenCount = token_id;
+        id_to_token[token_id] = token;
+        emit NewExchange(token, address(exchange));
+        return address(exchange);
+    }
+
+    function getExchange(address token) external view returns (address) {
+        return token_to_exchange[token];
+    }
+
+    function getToken(address exchange) external view returns (address) {
+        return exchange_to_token[exchange];
+    }
+
+    function getTokenWithId(uint256 token_id) external view returns (address) {
+        return id_to_token[token_id];
+    }
+}
+```
+
+这里主要关注`token_to_exchange`，就是一个 token 地址到 Exchange 地址的映射。V1 版本的工厂合约就是这么简单，接下来开始进入重点。
+
+## 交易合约
+
+V1 的 Exchange 仅支持 ERC20 token 和 ETH 之间的兑换，这里也没有 WETH 的转换。
+
+### 价格计算
+
+首先我们来推导一下计算公式。
+假设交易两个 token X 和 Y，x 和 y 分别是 Exchange 里 X 和 Y 的数量，同时$x×y=k$。因为要保持乘积 k 不变，当卖出 Δx 的 X 时，得到 Δy 的 Y， Exchange 里的数量满足$(x+Δx)×(y−Δy)=k$ 。
+交易之后 X 和 Y 的数量为：
+
+$x' = x + Δx = (1 + α)x = \frac 1 {1- β} x$
+
+$y' = y - Δy = \frac 1 {(1 + α)} y = (1- β)y$
+
+其中 $α = \frac {Δx} x$ ， $β = \frac {Δy} y$ 也就是变化值和原来数量的比值
+
+因此我们可以得到
+
+$Δx = \frac β {1- β} x$
+
+$Δy = \frac α {(1 + α)} y$
+
+根据上面两个公式，当我们已知输入数量 Δx 的时候可以得到输出数量 Δy，而当我们确定要获得数量 Δy 的时候可以计算要输入的数量 Δx。上面的推导是不考虑交易手续费的情况，下面我们加入手续费 ρ， $0 ≤ ρ < 1$ ，V1 里面 ρ=0.003 也就是 0.3%。
+
+$x'_ρ = x + Δx = (1 + α)x = \frac {1 + β(\frac 1 γ - 1)}{1- β}x$
+
+$y'_ρ = y - Δy = \frac 1 {(1 + αγ)} y = (1- β)y$
+
+其中 $γ = 1 − ρ$
+
+加上手续费之后
+
+$Δx = \frac β {1- β} \cdot \frac 1 γ \cdot x$
+
+$Δy = \frac {αγ}  {(1 + αγ )} \cdot y$
+
+$k_ρ = x'_ρ × y'_ρ = (1 + β(\frac 1 γ - 1))xy$
+
+我们可以看到当有手续费时 $γ < 1$，得到的 k 会比原来的大。
+
+### 交易滑点
+
+### 流动性管理
+
+![dapp](/defi/uniswap/v1_pairs.jpeg)
+
+## 参考&引用
+
+https://github.com/Uniswap/v1-contracts
+
+https://github.com/Uniswap/v1-docs
+
+https://github.com/runtimeverification/verified-smart-contracts/blob/master/uniswap/x-y-k.pdf
+
+https://learnblockchain.cn/article/1448

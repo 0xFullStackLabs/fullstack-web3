@@ -13,6 +13,10 @@ const config: DocsThemeConfig = {
   footer: {
     text: 'Web3全栈开发',
   },
+  i18n: [
+    { locale: 'en', text: 'English' },
+    { locale: 'zh', text: '中文' },
+  ]
 }
 
 export default config
