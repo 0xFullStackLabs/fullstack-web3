@@ -13,3 +13,13 @@ https://jeiwan.net/posts/programming-defi-uniswapv2-1/
 
 
 
+
+    First step is to sort token addresses. Remember the createPair function? We used sorted token addresses as salt.
+    Next, we build a sequence of bytes that includes:
+        0xff – this first byte helps to avoid collisions with CREATE opcode. (More details are in EIP-1014.)
+        factoryAddress – factory that was used to deploy the pair.
+        salt – token addressees sorted and hashed.
+        hash of pair contract bytecode – we hash creationCode to get this value.
+    Then, this sequence of bytes gets hashed (keccak256) and converted to address (bytes->uint256->uint160->address).
+
+This whole process is defined in EIP-1014 and implemented in the CREATE2 opcode. What we’re doing here is reimplementing address generation in Solidity!

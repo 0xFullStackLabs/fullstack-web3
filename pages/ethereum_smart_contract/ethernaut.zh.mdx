@@ -1,0 +1,27 @@
+# ethernaut
+
+https://ethernaut.openzeppelin.com/
+
+Introduction
+
+Ethernaut is an (awesome) browser game that let’s you practice Web3 and Solidity whilte solving different tasks. The game consists of 23 levels (as of August 2021) and each level is focused on some Solidity feature or bug, smart contract design flaw, or unexpected behaviour of a contract. Your goals in each level is to hack it: to find a way of becoming a contract owner, to transfer all tokens to your own address, or abuse a feature of Solidity that wasn’t taken into consideration by a smart contract developer.
+
+This is game a rare opportunity to get some real practical skills if you already know some basics of Web3 and Solidity. This is also a good opportunity to deepen your knowledge of Solidity because some levels are very hardcore – you won’t solve them without diving into the internals of Solidity and EVM.
+
+In this blog post, I’ll tell you about my experience solving the game and will give you some hints for each of the levels. If want to see complete solutions, you can find them on GitHub. Just remember: there’s more than one way of solving the levels, finding your own solutions might be more benefitial to you than simply solving the game.
+
+## 提示
+
+### 0. Hello Ethernaut
+
+按照指示就行
+
+### 1. Fallback
+
+知识点：Receive() 函数的作用；如何在交易中发送 ether。
+
+call contribute() and send some ethers to become a contributor, send some ethers to the contract to become an owner, call withdraw() to withdraw all funds.
+
+`await contract.contribute({value: 1}) `
+
+`await contract.sendTransaction({from:player, value:1, data:""}) `

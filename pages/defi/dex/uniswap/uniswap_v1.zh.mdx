@@ -57,10 +57,31 @@ contract Factory is IFactory {
 
 V1 的 Exchange 仅支持 ERC20 token 和 ETH 之间的兑换，这里也没有 WETH 的转换。
 
+```solidity showLineNumbers filename="Exchange.sol"
+contract Exchange is ERC20, IExchange {
+    IERC20 public token;
+    IFactory public factory;
+
+    constructor(address token_addr) ERC20("Uniswap LP Token", "UNI-LP") {
+        require(token_addr != address(0), "invalid token address");
+        token = IERC20(token_addr);
+        factory = IFactory(msg.sender);
+    }
+}
+```
+
+Exchange 继承了 ERC20，是因为 Exchange 本身也代表了流动性的数量，也就是 LP 代币，下面流动性管理的小节会详细说明。
+
+Exchange 只存储了两个变量，token 地址和工厂地址。
+
 ### 价格计算
 
-首先我们来推导一下计算公式。
-假设交易两个 token X 和 Y，x 和 y 分别是 Exchange 里 X 和 Y 的数量，同时$x×y=k$。因为要保持乘积 k 不变，当卖出 Δx 的 X 时，得到 Δy 的 Y， Exchange 里的数量满足$(x+Δx)×(y−Δy)=k$ 。
+我们已经知道了恒定乘积公式$x×y=k$，接下来我们就来看这一公式的具体含义是什么。
+
+假设交易两个 token X 和 Y，x 和 y 分别是 Exchange 里 X 和 Y 的数量，同时$x×y=k$。因为要保持乘积 k 不变，当卖出 Δx 的 X 时，得到 Δy 的 Y， Exchange 里的数量满足$(x+Δx)×(y−Δy)=k$ 。它的函数图像如下：
+
+![dapp](/defi/uniswap/curve.png)
+
 交易之后 X 和 Y 的数量为：
 
 $x' = x + Δx = (1 + α)x = \frac 1 {1- β} x$
@@ -69,13 +90,21 @@ $y' = y - Δy = \frac 1 {(1 + α)} y = (1- β)y$
 
 其中 $α = \frac {Δx} x$ ， $β = \frac {Δy} y$ 也就是变化值和原来数量的比值
 
-因此我们可以得到
+因此我们可以得到：
 
 $Δx = \frac β {1- β} x$
 
 $Δy = \frac α {(1 + α)} y$
 
-根据上面两个公式，当我们已知输入数量 Δx 的时候可以得到输出数量 Δy，而当我们确定要获得数量 Δy 的时候可以计算要输入的数量 Δx。上面的推导是不考虑交易手续费的情况，下面我们加入手续费 ρ， $0 ≤ ρ < 1$ ，V1 里面 ρ=0.003 也就是 0.3%。
+$α = \frac β {1- β}$
+
+根据上面的公式，当我们已知输入数量 Δx 的时候可以得到输出数量 Δy，而当我们确定要获得数量 Δy 的时候可以计算要输入的数量 Δx。
+
+我们知道交易之前的价格是 $p= \frac x y$
+
+有了以上公式可以算出交易之后的价格变为 $p= \frac {x'} {y'} = {(1+α)}^2 \frac x y$
+
+上面的推导是不考虑交易手续费的情况，下面我们加入手续费 ρ， $0 ≤ ρ < 1$ ，V1 里面 ρ=0.003 也就是 0.3%。
 
 $x'_ρ = x + Δx = (1 + α)x = \frac {1 + β(\frac 1 γ - 1)}{1- β}x$
 
@@ -83,7 +112,7 @@ $y'_ρ = y - Δy = \frac 1 {(1 + αγ)} y = (1- β)y$
 
 其中 $γ = 1 − ρ$
 
-加上手续费之后
+加上手续费之后：
 
 $Δx = \frac β {1- β} \cdot \frac 1 γ \cdot x$
 
@@ -93,18 +122,234 @@ $k_ρ = x'_ρ × y'_ρ = (1 + β(\frac 1 γ - 1))xy$
 
 我们可以看到当有手续费时 $γ < 1$，得到的 k 会比原来的大。
 
+在实际的计算中，我们只会用到 x , y , Δx, Δy。
+
+有了以上理论基础，我们来看合约是怎么实现的。
+
+```solidity filename="Exchange.sol"
+       /**
+     * @dev Pricing function for converting between ETH && Tokens.
+     * @param input_amount Amount of ETH or Tokens being sold.
+     * @param input_reserve Amount of ETH or Tokens (input type) in exchange reserves.
+     * @param output_reserve Amount of ETH or Tokens (output type) in exchange reserves.
+     * @return Amount of ETH or Tokens bought.
+     */
+    function getInputPrice(
+        uint256 input_amount,
+        uint256 input_reserve,
+        uint256 output_reserve
+    ) public view returns (uint256) {
+        require(input_reserve > 0 && output_reserve > 0, "INVALID_VALUE");
+        uint256 input_amount_with_fee = input_amount * 997;
+        uint256 numerator = input_amount_with_fee * output_reserve;
+        uint256 denominator = input_reserve * 1000 + input_amount_with_fee;
+        return numerator / denominator;
+    }
+```
+
+该函数的输入是 Δx , x , y，要求得 Δy，根据上面的公式可以推导：
+
+$Δy = \frac {Δx \cdot y } {x + Δx}$ 再加上手续费 $Δy = \frac {Δxγ \cdot y } {x + Δxγ}$
+
+由于 Solidity 只有整数除法，因此只能用 $\frac {997} {1000}$ 表示千分之三的手续费。这种方式肯定会有精度误差，但是并不会累积，不会产生套利空间。具体的证明请见参考 3。同时我们可以看到手续费是扣的进入流动性池的那种代币。
+
+接下来看如果固定输出的数量，如何计算需要输入的数量。
+
+```solidity filename="Exchange.sol"
+    /**
+     * @dev Pricing function for converting between ETH && Tokens.
+     * @param output_amount Amount of ETH or Tokens being bought.
+     * @param input_reserve Amount of ETH or Tokens (input type) in exchange reserves.
+     * @param output_reserve Amount of ETH or Tokens (output type) in exchange reserves.
+     * @return Amount of ETH or Tokens sold.
+     */
+    function getOutputPrice(
+        uint256 output_amount,
+        uint256 input_reserve,
+        uint256 output_reserve
+    ) public view returns (uint256) {
+        require(input_reserve > 0 && output_reserve > 0);
+        uint256 numerator = input_reserve * output_amount * 1000;
+        uint256 denominator = (output_reserve - output_amount) * 997;
+        return (numerator / denominator) + 1;
+    }
+```
+
+该函数的输入是 Δy , x , y，要求得 Δx，根据上面的公式可以推导：
+
+$Δx = \frac {x \cdot Δy } {y - Δy}$ 再加上手续费 $Δx = \frac {x \cdot Δy } {y - Δy} \cdot \frac 1 γ$
+
+以上两个函数就是交易部分的核心函数，其他都是调用这两个函数，计算好所需的数量后发起转账。 接下来我们来看一下交易滑点的问题。
+
 ### 交易滑点
+
+交易滑点是指最终交易的价格和现在的价格有差别，它的出现主要是由于流动性不足，这个问题在中心化交易所也有。我们这里不考虑同一区块里其他交易的影响，也不考虑手续费，只讨论算法本身带来的滑点。
+
+单次交易的初始价格 $p = \frac {x} {y}$
+
+单次交易的实际价格 $p' = \frac {Δx} {Δy} = (1+α) \frac x y$
+
+一般我们计算滑点是价格差和初始价格的比值,即 $s = \frac {p' - p} p = α = \frac {Δx} x$
+
+可见交易滑点等于这笔交易 X 的数量 Δx 占整个流动池里 X 的数量 x 的比值，而 X 是交易里让流动池增加的那个代币，对交易者来说是卖出的币，这也符合我们的直觉。
+
+### 无常损失
+
+无常损失是指非永久性损失，是相对不放进流动性池直接持币的收益差。当我们把资产放在流动池里的时候，只要价格变化，肯定有一种资产数量变多，一种变少，相当于在自动抛售一种资产。举个例子，同样的 1ETH，当 ETH 从 1000 USDT 涨到 1500 USDT， 如果是放在钱包里，就是赚了 500 USDT，
+如果是放在流动池里，相当于从 1000 到 1500 的过程中一直在抛售 ETH，自然会少赚。但是只要价格回到 1000，这个差就没有了，所以才叫无常损失。
 
 ### 流动性管理
 
+上面我们是在池子里已有一定流动性的基础上讨论交易带来的代币数量的变化。这一节我们来讨论添加、移除流动性的时候发什么了什么。
+
+添加流动性有两种情况，首次添加和非首次添加。如果是首次添加流动性，添加者可以用任何数量和比例加入两种代币，也就是决定它们的价格。如果不是首次，那么需要维持两个代币的比例不变才不会对价格产生影响。
+
+另外，当添加流动性之后，我们需要某种凭证代表你添加的流动性的数量，这个凭证要能反映你添加的流动性占总流动性的比例，这样才好分配手续费。Uniswap V1 采用 ERC20 代币来表示流动性，也就是 LP token。
+
+Uniswap V1 是在 ETH 数量基础上计算的，新注入的流动性获得的 LP token 的数量跟加入的 ETH 占原来 ETH 总量的比例一样。
+
+$amountMinted=totalAmount∗ \frac {ethReserve} {ethDeposited}​ $
+
+```solidity filename="Exchange.sol"
+    /**
+     * @notice Deposit ETH and Tokens (this.token) at current ratio to mint UNI tokens.
+     * @dev min_liquidity does nothing when total UNI supply is 0.
+     * @param min_liquidity Minimum number of UNI sender will mint if total UNI supply is greater than 0.
+     * @param max_tokens Maximum number of tokens deposited. Deposits max amount if total UNI supply is 0.
+     * @param deadline Time after which this transaction can no longer be executed.
+     * @return The amount of UNI minted.
+     */
+    function addLiquidity(
+        uint256 min_liquidity,
+        uint256 max_tokens,
+        uint256 deadline
+    ) public payable returns (uint256) {
+        require(deadline > block.timestamp, "deadline passed");
+        uint256 total_liquidity = totalSupply();
+        if (total_liquidity > 0) {
+            require(min_liquidity > 0, "min_liquidity must be greater than 0");
+            uint256 eth_reserve = address(this).balance - msg.value;
+            uint256 token_reserve = token.balanceOf(address(this));
+            uint256 token_amount = ((msg.value * token_reserve) / eth_reserve) +
+                1;
+            uint256 liquidity_minted = (msg.value * total_liquidity) /
+                eth_reserve;
+            require(max_tokens >= token_amount, "insufficient token amount");
+            require(
+                liquidity_minted >= min_liquidity,
+                "insufficient liquidity provided"
+            );
+            token.transferFrom(msg.sender, address(this), token_amount);
+            _mint(msg.sender, liquidity_minted);
+            emit AddLiquidity(msg.sender, msg.value, token_amount);
+            return liquidity_minted;
+        } else {
+            require(
+                msg.value >= 1000000000,
+                "need more than 1000000000 wei to create pool"
+            );
+            token.transferFrom(msg.sender, address(this), max_tokens);
+            uint256 initial_liquidity = address(this).balance;
+            _mint(msg.sender, initial_liquidity);
+            emit AddLiquidity(msg.sender, msg.value, max_tokens);
+            return initial_liquidity;
+        }
+    }
+```
+
+首次添加流动性的时候，直接按照注入的 ETH 数量返回 LP。这里要求注入的 ETH 要大于 1000000000，主要是为了避免开始加入的流动性过小，影响后续的交易。
+
+后面添加流动性，就会按照上面的公式进行计算，只不过最后加 1，这是为了弥补精度误差，具体见参考 3。
+
+移除流动性
+
+$removedAmount=reserve∗ \frac {totalAmount} {LPamountLP}​$
+
+```solidity filename="Exchange.sol"
+/**
+     * @dev Burn UNI tokens to withdraw ETH && Tokens at current ratio.
+     * @param amount Amount of UNI burned.
+     * @param min_eth Minimum ETH withdrawn.
+     * @param min_tokens Minimum Tokens withdrawn.
+     * @param deadline Time after which this transaction can no longer be executed.
+     * @return The amount of ETH && Tokens withdrawn.
+     */
+    function removeLiquidity(
+        uint256 amount,
+        uint256 min_eth,
+        uint256 min_tokens,
+        uint256 deadline
+    ) public returns (uint256, uint256) {
+        require(
+            amount > 0 &&
+                deadline > block.timestamp &&
+                min_eth > 0 &&
+                min_tokens > 0
+        );
+        uint256 total_liquidity = totalSupply();
+        require(total_liquidity > 0);
+        uint256 token_reserve = token.balanceOf(address(this));
+        uint256 eth_amount = (amount * address(this).balance) / total_liquidity;
+        uint256 token_amount = (amount * token_reserve) / total_liquidity;
+        require(eth_amount >= min_eth && token_amount >= min_tokens);
+        _burn(msg.sender, amount);
+        payable(msg.sender).transfer(eth_amount);
+        require(token.transfer(msg.sender, token_amount));
+        emit RemoveLiquidity(msg.sender, eth_amount, token_amount);
+        return (eth_amount, token_amount);
+    }
+```
+
+### 代币之间交易
+
+    虽然Uniswap V1 的Exchange仅支持代币和ETH之间的交易，但是可以通过中间的转换间接实现代币和代币之间的交易。
+
+
 ![dapp](/defi/uniswap/v1_pairs.jpeg)
+
+```solidity filename="Exchange.sol"
+    function tokenToTokenInput(
+        uint256 tokens_sold,
+        uint256 min_tokens_bought,
+        uint256 min_eth_bought,
+        uint256 deadline,
+        address buyer,
+        address recipient,
+        address payable exchange_addr
+    ) private returns (uint256) {
+        require(
+            deadline >= block.timestamp &&
+                tokens_sold > 0 &&
+                min_tokens_bought > 0 &&
+                min_eth_bought > 0
+        );
+        require(exchange_addr != address(this) && exchange_addr != address(0));
+        uint256 token_reserve = token.balanceOf(address(this));
+        uint256 eth_bought = getInputPrice(
+            tokens_sold,
+            token_reserve,
+            address(this).balance
+        );
+        uint256 wei_bought = eth_bought;
+        require(wei_bought >= min_eth_bought);
+        require(token.transferFrom(buyer, address(this), tokens_sold));
+        uint256 tokens_bought = IExchange(exchange_addr)
+            .ethToTokenTransferInput{value: wei_bought}(
+            min_tokens_bought,
+            deadline,
+            recipient
+        );
+        emit EthPurchase(buyer, tokens_sold, wei_bought);
+        return tokens_bought;
+    }
+```
 
 ## 参考&引用
 
-https://github.com/Uniswap/v1-contracts
+1. https://github.com/Uniswap/v1-contracts
 
-https://github.com/Uniswap/v1-docs
+2. https://github.com/Uniswap/v1-docs
 
-https://github.com/runtimeverification/verified-smart-contracts/blob/master/uniswap/x-y-k.pdf
+3. https://github.com/runtimeverification/verified-smart-contracts/blob/master/uniswap/x-y-k.pdf
 
-https://learnblockchain.cn/article/1448
+4. https://learnblockchain.cn/article/1448
