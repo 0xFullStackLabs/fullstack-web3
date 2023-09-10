@@ -1,0 +1,9 @@
+{
+  "tools": "开发环境和工具",
+  "evm": "深入理解EVM",
+  "advanced": "Solidity进阶",
+  "eip": "常用EIP",
+  "practice": "实践",
+  "ctf": "CTF",
+  "questions": "练习问题"
+}

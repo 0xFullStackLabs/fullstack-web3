@@ -1,0 +1,10 @@
+{
+    "blockchain": "区块链网络",
+    "wallet": "钱包",
+    "contract": "EVM和智能合约",
+    "indexing": "数据索引",
+    "oracle": "预言机",
+    "storage": "存储",
+    "layer2": "二层网络",
+    "crosschain": "跨链"
+}

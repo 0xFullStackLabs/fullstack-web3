@@ -1,0 +1,52 @@
+# 常见错误
+
+
+send transfer
+
+
+Since byzantium staticcall can be used as well. This is basically the same as call, but will revert if the called function modifies the state in any way.
+
+All three functions call, delegatecall and staticcall are very low-level functions and should only be used as a last resort as they break the type-safety of Solidity.
+
+The gas option is available on all three methods, while the value option is only available on call.
+
+It is best to avoid relying on hardcoded gas values in your smart contract code, regardless of whether state is read from or written to, as this can have many pitfalls. Also, access to gas might change in the future.
+
+
+While most operators produce a literal expression when applied to literals, there are certain operators that do not follow this pattern:
+
+```
+    Ternary operator (... ? ... : ...),
+    Array subscript (<array>[<index>]).
+```
+You might expect expressions like 255 + (true ? 1 : 0) or 255 + [1, 2, 3][0] to be equivalent to using the literal 256 directly, but in fact they are computed within the type uint8 and can overflow.
+
+Any operator that can be applied to integers can also be applied to number literal expressions as long as the operands are integers. If any of the two is fractional, bit operations are disallowed and exponentiation is disallowed if the exponent is fractional (because that might result in a non-rational number).
+
+Shifts and exponentiation with literal numbers as left (or base) operand and integer types as the right (exponent) operand are always performed in the uint256 (for non-negative literals) or int256 (for a negative literals) type, regardless of the type of the right (exponent) operand.
+
+Warning
+
+Division on integer literals used to truncate in Solidity prior to version 0.4.0, but it now converts into a rational number, i.e. 5 / 2 is not equal to 2, but to 2.5.
+
+
+Dynamically-sized arrays can only be resized in storage. In memory, such arrays can be of arbitrary size but the size cannot be changed once an array is allocated.
+
+To be safe, only enlarge bytes arrays by at most one element during a single assignment and do not simultaneously index-access the array in the same statement.
+
+```solidity
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity >=0.8.0 <0.9.0;
+
+// This will report a warning
+contract C {
+    bytes x = "012345678901234567890123456789";
+
+    function test() external returns(uint) {
+        (x.push(), x.push()) = (0x01, 0x02);
+        return x.length;
+    }
+}
+```
+
+Note that there is no type conversion from non-boolean to boolean types as there is in C and JavaScript, so if (1) `{ ... }` is not valid Solidity.

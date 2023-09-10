@@ -1,0 +1,778 @@
+# V2 做了哪些改动？
+
+1. 支持任意 ERC20 代币之间的交易对
+
+2. 价格预言机
+
+3. 闪电贷
+
+4. 实现细节变动
+
+Uniswap V2 合约分成了 [v2-core](https://github.com/Uniswap/v2-core) 和 [v2-periphery](https://github.com/Uniswap/v2-periphery/) 两个仓库，uniswap-v2-core 就是核心合约的实现； uniswap-v2-periphery 则提供了和 Uniswap V2 进行交互的外围合约，主要就是路由合约。
+
+阅读 V2 之前请先阅读 V1 了解基础概念，本文的主要目的是介绍差异和新增的部分。
+
+## uniswap-v2-core
+
+core 主要有三个合约文件：
+
+    UniswapV2Factory.sol：工厂合约
+
+    UniswapV2Pair.sol：配对合约
+
+    UniswapV2ERC20.sol：LP Token 合约
+
+### 工厂合约
+
+工厂合约是用来部署配对合约的，通过工厂合约的 createPair() 函数来创建新的配对合约实例。
+
+V2 工厂合约的主要改动在使用了新的 opcode create2 来创建 Pair 合约，这样我们只要知道两个代币的地址就可以提前计算出 Pair 的地址。另外要注意的是通过 create2 创建的合约没法通过构造函数传入参数，所以需要手动调用 initialize 传入两个代币地址。
+
+```solidity filename="UniswapV2Factory.sol"
+function createPair(address tokenA, address tokenB) external returns (address pair) {
+    require(tokenA != tokenB, 'UniswapV2: IDENTICAL_ADDRESSES');
+    (address token0, address token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+    require(token0 != address(0), 'UniswapV2: ZERO_ADDRESS');
+    require(getPair[token0][token1] == address(0), 'UniswapV2: PAIR_EXISTS'); // single check is sufficient
+    bytes memory bytecode = type(UniswapV2Pair).creationCode;
+    bytes32 salt = keccak256(abi.encodePacked(token0, token1));
+    assembly {
+        pair := create2(0, add(bytecode, 32), mload(bytecode), salt)
+    }
+    IUniswapV2Pair(pair).initialize(token0, token1);
+    getPair[token0][token1] = pair;
+    getPair[token1][token0] = pair; // populate mapping in the reverse direction
+    allPairs.push(pair);
+    emit PairCreated(token0, token1, pair, allPairs.length);
+}
+```
+
+在`create2`之前，我们可以通过`create` 或者 `new` 关键字来创建新的合约，这两者是等效的，都是由创建者的 nonce 来决定合约地址的。为了拥有确定性的合约地址后来在 [EIP-1014](https://eips.ethereum.org/EIPS/eip-1014) 加入了`create2`。`create2` 有四个参数，第一个是发送到新合约的 wei 的数量；第二个是新地址初始码的内存偏移值，byte 表示；第三个是初始码的长度；最后是盐。 `memory` 类型变量其实是指向起始内存地址的指针，也就是说 `bytecode` 是 UniswapV2Pair `creationCode` 的指针。它其实是一个 bytes 数组，而 bytes 数组在 solidity 内存中
+起始的 32 bytes 是数组的长度。所以我们需要在 `bytecode` 基础上加 32 得到真实的 `creationCode` 数据。`mload` 的作用就是加载指定内存地址的 32 bytes 的数据，这里刚好就是 `creationCode` 的长度。具体内容可以参考内存布局章节。最后我们看到盐值是由两个 token 地址确定的，所以只要 token 地址确定了，pair 的地址也就确定了。
+
+### UniswapV2ERC20 合约
+
+UniswapV2ERC20 其实就是加入了 [ERC2612](https://eips.ethereum.org/EIPS/eip-2612) 的 ERC20 代币合约，而 ERC2612 主要是加入了链下签名 approve 功能。另外 UniswapV2ERC20 还加入了 mint 和 burn 的功能，可以修改`totalSupply`。
+
+### 配对合约
+
+UniswapV2Pair 继承自 UniswapV2ERC20，同 V1 的 Exchange 合约 一样，配对合约管理着流动性资金池，不同币对有着不同的配对合约实例，比如 USDT-WETH 这一个币对，就对应一个配对合约实例，DAI-WETH 又对应另一个配对合约实例。和 V1 不同的是，V2 是 仅支持 ERC20 之间的配对，所以需要先将 ETH 转化为 WETH，才能在 Uniswap V2 交易。
+
+```solidity filename="UniswapV2Pair.sol"
+contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
+    using SafeMath  for uint;
+    using UQ112x112 for uint224;
+
+    uint public constant MINIMUM_LIQUIDITY = 10**3;
+    bytes4 private constant SELECTOR = bytes4(keccak256(bytes('transfer(address,uint256)')));
+
+    address public factory;
+    address public token0;
+    address public token1;
+
+    uint112 private reserve0;           // uses single storage slot, accessible via getReserves
+    uint112 private reserve1;           // uses single storage slot, accessible via getReserves
+    uint32  private blockTimestampLast; // uses single storage slot, accessible via getReserves
+
+    uint public price0CumulativeLast;
+    uint public price1CumulativeLast;
+    uint public kLast; // reserve0 * reserve1, as of immediately after the most recent liquidity event
+
+    uint private unlocked = 1;
+    modifier lock() {
+        require(unlocked == 1, 'UniswapV2: LOCKED');
+        unlocked = 0;
+        _;
+        unlocked = 1;
+    }
+
+    function getReserves() public view returns (uint112 _reserve0, uint112 _reserve1, uint32 _blockTimestampLast) {
+        _reserve0 = reserve0;
+        _reserve1 = reserve1;
+        _blockTimestampLast = blockTimestampLast;
+    }
+
+    function _safeTransfer(address token, address to, uint value) private {
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(SELECTOR, to, value));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), 'UniswapV2: TRANSFER_FAILED');
+    }
+
+    event Mint(address indexed sender, uint amount0, uint amount1);
+    event Burn(address indexed sender, uint amount0, uint amount1, address indexed to);
+    event Swap(
+        address indexed sender,
+        uint amount0In,
+        uint amount1In,
+        uint amount0Out,
+        uint amount1Out,
+        address indexed to
+    );
+    event Sync(uint112 reserve0, uint112 reserve1);
+
+    constructor() public {
+        factory = msg.sender;
+    }
+
+    // called once by the factory at time of deployment
+    function initialize(address _token0, address _token1) external {
+        require(msg.sender == factory, 'UniswapV2: FORBIDDEN'); // sufficient check
+        token0 = _token0;
+        token1 = _token1;
+    }
+```
+
+前面说过，配对合约是由工厂合约创建的，我们从构造函数和初始化函数中就可以看出来，构造函数直接将 msg.sender 设为了 factory ，factory 就是工厂合约地址。初始化函数又 require 调用者需是工厂合约，而且工厂合约中只会初始化一次。
+
+#### 流动性管理
+
+回顾一下 V1 中我们通过`addLiquidity` 和 `removeLiquidity`来添加移除流动性，在 V2 中这个接口放到了 Router 合约中，Pair 合约中只进行最核心的操作，管理流动性代币。V2 中将转币逻辑和流动性计算解耦，让转币在 Router 中完成，这样方便实现多种转币逻辑，不一定是调用`transferFrom`，还可以使用 permit 这种线下签名方式或者未来其他的方式。
+
+```solidity filename="UniswapV2Pair.sol"
+// this low-level function should be called from a contract which performs important safety checks
+function mint(address to) external lock returns (uint liquidity) {
+    (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
+    uint balance0 = IERC20(token0).balanceOf(address(this));
+    uint balance1 = IERC20(token1).balanceOf(address(this));
+    uint amount0 = balance0.sub(_reserve0);
+    uint amount1 = balance1.sub(_reserve1);
+
+    bool feeOn = _mintFee(_reserve0, _reserve1);
+    uint _totalSupply = totalSupply; // gas savings, must be defined here since totalSupply can update in _mintFee
+    if (_totalSupply == 0) {
+        liquidity = Math.sqrt(amount0.mul(amount1)).sub(MINIMUM_LIQUIDITY);
+        _mint(address(0), MINIMUM_LIQUIDITY); // permanently lock the first MINIMUM_LIQUIDITY tokens
+    } else {
+        liquidity = Math.min(amount0.mul(_totalSupply) / _reserve0, amount1.mul(_totalSupply) / _reserve1);
+    }
+    require(liquidity > 0, 'UniswapV2: INSUFFICIENT_LIQUIDITY_MINTED');
+    _mint(to, liquidity);
+
+    _update(balance0, balance1, _reserve0, _reserve1);
+    if (feeOn) kLast = uint(reserve0).mul(reserve1); // reserve0 and reserve1 are up-to-date
+    emit Mint(msg.sender, amount0, amount1);
+}
+
+// this low-level function should be called from a contract which performs important safety checks
+function burn(address to) external lock returns (uint amount0, uint amount1) {
+    (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
+    address _token0 = token0;                                // gas savings
+    address _token1 = token1;                                // gas savings
+    uint balance0 = IERC20(_token0).balanceOf(address(this));
+    uint balance1 = IERC20(_token1).balanceOf(address(this));
+    uint liquidity = balanceOf[address(this)];
+
+    bool feeOn = _mintFee(_reserve0, _reserve1);
+    uint _totalSupply = totalSupply; // gas savings, must be defined here since totalSupply can update in _mintFee
+    amount0 = liquidity.mul(balance0) / _totalSupply; // using balances ensures pro-rata distribution
+    amount1 = liquidity.mul(balance1) / _totalSupply; // using balances ensures pro-rata distribution
+    require(amount0 > 0 && amount1 > 0, 'UniswapV2: INSUFFICIENT_LIQUIDITY_BURNED');
+    _burn(address(this), liquidity);
+    _safeTransfer(_token0, to, amount0);
+    _safeTransfer(_token1, to, amount1);
+    balance0 = IERC20(_token0).balanceOf(address(this));
+    balance1 = IERC20(_token1).balanceOf(address(this));
+
+    _update(balance0, balance1, _reserve0, _reserve1);
+    if (feeOn) kLast = uint(reserve0).mul(reserve1); // reserve0 and reserve1 are up-to-date
+    emit Burn(msg.sender, amount0, amount1, to);
+}
+```
+
+我们先来看添加流动性。首先我们要计算新加入的代币数量，用现在的 Balance 减去 Reserve。当第一次注入流动性时，V1 是取 ETH 的数量作为 LP Token 的数量，但是这种做法 LP token 的价值受到两种代币比值的影响较大， V2 中流动性代币数量的计算方法是取注入的两种代币的数量的几何平均，也就是相乘再开根号来降低这种影响。
+
+$ Liquidity\_{minted} = \sqrt {Amount0​∗Amount1​}$
+
+我们需要注意到 V2 还加入了最小流动性，`MINIMUM_LIQUIDITY`，1000wei，打到了黑洞地址。 这主要是为了防止单份流动性价值过高导致小的流动性提供者无法添加流动性。
+
+当池子里已经有流动性时，我们得到的流动性代币是根据加入的数量和原来数量的比值确定的，只不过 V2 中我们有两种代币，到底使用哪个计算呢？V2 选择比值较小的那个。
+
+`liquidity = Math.min(amount0.mul(_totalSupply) / _reserve0, amount1.mul(_totalSupply) / _reserve1);`
+
+另外，这两个函数加了 `lock` 修饰器，其实就是为了防止重入攻击，因为调用了外部函数，也就是代币的 `balanceOf`。
+
+移除流动性正好相反，移除流动性意味着销毁 LP token 换回同等比例的底层代币资产。
+
+$ Amount*{token} = Reserve*{token} ∗ \frac {Balance*{LP}​}{TotalSupply*{LP}}$
+
+用户也是通过 Router 合约提前把 LP token 转到 Pair 合约，所以才能通过 `balanceOf[address(this)]` 拿到数量。
+
+这两个函数的最后都调用了`_update`函数，这个函数其实就是更新价格，下面我们来看什么是时间加权平均价格（TWAP）。
+
+#### 时间加权平均价格（TWAP）
+
+V1 里我们知道，代币的价格可以由 Pair 里代币的数量得到， $ p0 = \frac {reserve1} {reserve0}$。
+
+但是这种简单的做法用来作为链上的价格预言机并不安全，因为价格太容易被操控了，配合闪电贷很容易造成价格攻击，实际上也确实发生过通过操纵价格从借贷平台套利的[事件](https://samczsun.com/taking-undercollateralized-loans-for-fun-and-for-profit/)。
+
+因此 V2 做出了改良，首先是只取一个块的最后一笔交易之后的价格，（实现上是在第一笔交易取之前价格），因为这个价格不太容易被操控，即使你在上一区块最后一笔交易修改了价格，也不一定保证下一区块会包含你的交易（ Flashbots 也做不到）。第二是不通过`balanceOf`获取代币的存量，而是缓存在 reserve。另外还专门累加价格，减少某个时刻价格的影响。
+
+```solidity filename="UniswapV2Pair.sol"
+ // update reserves and, on the first call per block, price accumulators
+function _update(uint balance0, uint balance1, uint112 _reserve0, uint112 _reserve1) private {
+    require(balance0 <= uint112(-1) && balance1 <= uint112(-1), 'UniswapV2: OVERFLOW');
+    uint32 blockTimestamp = uint32(block.timestamp % 2**32);
+    uint32 timeElapsed = blockTimestamp - blockTimestampLast; // overflow is desired
+    if (timeElapsed > 0 && _reserve0 != 0 && _reserve1 != 0) {
+        // * never overflows, and + overflow is desired
+        price0CumulativeLast += uint(UQ112x112.encode(_reserve1).uqdiv(_reserve0)) * timeElapsed;
+        price1CumulativeLast += uint(UQ112x112.encode(_reserve0).uqdiv(_reserve1)) * timeElapsed;
+    }
+    reserve0 = uint112(balance0);
+    reserve1 = uint112(balance1);
+    blockTimestampLast = blockTimestamp;
+    emit Sync(reserve0, reserve1);
+}
+
+```
+
+这是 UniswapV2Pair 合约的 \_update 函数，每次 mint、burn、swap、sync 时都会触发更新。函数主体主要就以下几步：
+
+    1. 读取当前的区块时间 blockTimestamp
+    2. 计算出与上一次更新的区块时间之间的时间差 timeElapsed
+    3. 如果 timeElapsed > 0 且两个 token 的 reserve 都不为 0，则更新两个累加价格
+    4. 更新两个 reserve 和区块时间 blockTimestampLast
+
+我们在 Pair 合约里看到的很多 uint112 的地方其实都是为了计算价格加节省 Gas 费的实际考虑。在合约开头我们可以看到定义了一种新类型 `UQ112x112`，这是由于 Solidity 不支持非整数类型，所以 Uniswap V2 用了一种二进制定点格式来编码和计算价格。这种格式小数点两边各有 112 位，取值范围是$[0,  2^{112} − 1]$，精度是 $ \frac 1 {2^{112}}$。另外，
+我们需要明确的是这里的所有处理只影响价格的精度，不影响交易部分。
+
+接着我们看到 `reserve` 也是 uint112，其实就是只保存了整数部分的 `UQ112x112`，所以在参与计算之前要乘上 $2^{112}$，具体请参考 `UQ112x112.sol`。另外 `reserve0` `reserve1` 和 `blockTimestampLast` 共同组成了 256 bytes，刚好是内存读取的一个 slot，而且它们在使用中也是同时读取的，这样可以在一个 `SSTORE` 和 `SLOAD` 中完成操作，从而达成节省 GAS 的目的。
+
+Uniswap 选择 UQ112.112 的原因：因为 UQ112.112 可以被存储位 uint224，这会留下 32 位的空闲 Storage 插槽位。再一个是每个 Pair 合约的 reserve0 和 reserve1 都是 Uint112，同样会留下 32 位的空闲插槽位。特别的是 pair 合约的 reserve 连同最近一个区块的时间戳一起存储时，该时间戳会对 232232 取余数称为 uint32 格式的数值。加之，尽管在任意给定时刻的价格都是 UQ112.112 格式，保证为 uint224 位，一段时间累积的价格并不是该格式。在储存插槽中末端的额外的 32 位可以用来储存累积的价格的溢出部分。这种设计意味着在每一个区块的第一笔交易中只需要额外的三次 SSTORE 操作（目前的开销是 15000gas）。
+
+选择 UQ112.112 的缺点：最末端的 32 位用来储存时间戳会溢出，事实上一个 Uint32 的时间戳溢出点是 02/07/2106.
+
+这里笔者建议阅读白皮书价格预言机部分更加深入理解计算的原理和一些做法背后的原因。下图用示例帮助大家理解。
+
+![dapp](/defi/uniswap/TWAP1.png)
+
+在具体使用 TWAP 的时候，也不是直接获取一个价格，需要分别记录两次价格累加值，得到差值之后再除以时间差，用户可以根据需要决定相隔多久，时间越久越不容易被操纵，但是就不那么实时。在 uniswap-v2-periphery 项目中，examples 目录下提供了两种使用方式的示例代码，分为是 ExampleOracleSimple.sol 和 ExampleSlidingWindowOracle.sol，一个是固定窗口，另一个是滑动窗口，固定窗口就是
+简单按刚刚说的取一个固定时间。
+
+https://learnblockchain.cn/article/3960
+
+![dapp](/defi/uniswap/TWAP2.webp)
+
+#### safeTransfer
+
+Pair 合约里用了一种奇怪的方式发起转账，为什么不直接使用 transfer 呢？
+
+```solidity filename="UniswapV2Pair.sol"
+bytes4 private constant SELECTOR = bytes4(keccak256(bytes('transfer(address,uint256)')));
+
+function _safeTransfer(address token, address to, uint value) private {
+    (bool success, bytes memory data) = token.call(abi.encodeWithSelector(SELECTOR, to, value));
+    require(success && (data.length == 0 || abi.decode(data, (bool))), 'UniswapV2: TRANSFER_FAILED');
+}
+```
+
+根据 ERC20 的标准，transfer 函数要返回成功与否，但是并不是所有代币都会按照标准实现，包括一些知名代币比如 USDT、BNB 都没有返回。通过`call`调用至少可以知道函数调用是否成功。在 V1 中只要没有返回就默认是失败，V2 中改成了默认成功。
+
+#### swap
+
+swap 函数是交易功能的底层函数，同样是在 Router 合约里完成计算，再把参数传给 swap，在 swap 函数里负责转账以及校验。
+
+```solidity filename="UniswapV2Pair.sol"  showLineNumbers
+function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external lock {
+    require(amount0Out > 0 || amount1Out > 0, 'UniswapV2: INSUFFICIENT_OUTPUT_AMOUNT');
+    (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
+    require(amount0Out < _reserve0 && amount1Out < _reserve1, 'UniswapV2: INSUFFICIENT_LIQUIDITY');
+
+    uint balance0;
+    uint balance1;
+    { // scope for _token{0,1}, avoids stack too deep errors
+    address _token0 = token0;
+    address _token1 = token1;
+    require(to != _token0 && to != _token1, 'UniswapV2: INVALID_TO');
+    if (amount0Out > 0) _safeTransfer(_token0, to, amount0Out); // optimistically transfer tokens
+    if (amount1Out > 0) _safeTransfer(_token1, to, amount1Out); // optimistically transfer tokens
+    if (data.length > 0) IUniswapV2Callee(to).uniswapV2Call(msg.sender, amount0Out, amount1Out, data);
+    balance0 = IERC20(_token0).balanceOf(address(this));
+    balance1 = IERC20(_token1).balanceOf(address(this));
+    }
+    uint amount0In = balance0 > _reserve0 - amount0Out ? balance0 - (_reserve0 - amount0Out) : 0;
+    uint amount1In = balance1 > _reserve1 - amount1Out ? balance1 - (_reserve1 - amount1Out) : 0;
+    require(amount0In > 0 || amount1In > 0, 'UniswapV2: INSUFFICIENT_INPUT_AMOUNT');
+    { // scope for reserve{0,1}Adjusted, avoids stack too deep errors
+    uint balance0Adjusted = balance0.mul(1000).sub(amount0In.mul(3));
+    uint balance1Adjusted = balance1.mul(1000).sub(amount1In.mul(3));
+    require(balance0Adjusted.mul(balance1Adjusted) >= uint(_reserve0).mul(_reserve1).mul(1000**2), 'UniswapV2: K');
+    }
+
+    _update(balance0, balance1, _reserve0, _reserve1);
+    emit Swap(msg.sender, amount0In, amount1In, amount0Out, amount1Out, to);
+}
+```
+
+`amount0Out` 和 `amount1Out` 就是两种代币分别要转的数量，通常其中一个是 0，但使用闪电交易时可能两个都不为 0。to 参数则是接收者地址，最后的 data 参数是执行回调时的传递数据，通过路由合约兑换的话，该值为 0。
+
+前 4 行代码很好理解，第一步先校验兑换结果的数量是否有一个大于 0，然后读取出两个代币的 reserve，之后再校验兑换数量是否小于 reserve。
+
+从第 8 行开始，到第 17 行结束，用了一对大括号，这主要是为了限制 \_token\{0,1} 这两个临时变量的作用域，防止堆栈太深导致错误，而之所以要这两个临时变量还是为了节省 GAS。
+
+第 12 和 13 行，先乐观地将代币划转到接收者地址，才能得到最终剩下的余额，之后再进行 K 值的校验。
+
+第 14 行，如果 data 参数长度大于 0，则将 to 地址转为 `IUniswapV2Callee` 并调用其 `uniswapV2Call` 函数，这其实就是一个回调函数，to 地址需要实现该接口。
+
+第 15 和 16 行，获取两个代币当前的余额 balance\{0,1} ，而这个余额是扣减了转出代币后的余额。
+
+第 18 和 19 行则是计算出实际转入的代币数量。实际转入的数量其实也通常是一个为 0，一个不为 0 。计算这个主要是为了下面计算扣掉手续费后的 balance。
+
+第 23 和 24 行计算扣掉手续费之后的balance，这里跟V1一样，因为没有小数和精度问题，得先乘1000。
+
+第 24 行是 K 值校验，交易后的 K 值必须大于等于原来的 K 值，这里注意后面要乘以1000**2。
+
+最后同样调用`_update()`更新价格。
+
+#### skim & sync
+
+## uniswap-v2-periphery
+
+### 库合约
+
+从这里开始我们就要进入 periphery 仓库了。首先介绍会被其他合约用到的库合约 UniswapV2Library。库合约是没有状态的，是在调用合约的存储空间里执行的。
+
+#### sortTokens
+
+首先来看第一个函数 `sortTokens`，比较两个 token 的地址，较小的排在前面，跟工厂合约里创建 pair 时顺序保持一致。
+
+```solidity filename="UniswapV2Library.sol"
+// returns sorted token addresses, used to handle return values from pairs sorted in this order
+function sortTokens(address tokenA, address tokenB) internal pure returns (address token0, address token1) {
+    require(tokenA != tokenB, 'UniswapV2Library: IDENTICAL_ADDRESSES');
+    (token0, token1) = tokenA < tokenB ? (tokenA, tokenB) : (tokenB, tokenA);
+    require(token0 != address(0), 'UniswapV2Library: ZERO_ADDRESS');
+}
+```
+
+#### pariFor
+
+然后是 pariFor 函数，根据两个 token 地址返回 pair 的地址。这里计算 pair 地址的过程就是 create2 生成地址的算法[EIP-1014](https://eips.ethereum.org/EIPS/eip-1014)。 首先给两个 token 排序，后面用来计算盐值。然后`abi.encodePacked` 编码的序列依次是 '0xff'，避免和`CREATE` opcode 冲突；factory 地址；盐值；pair 合约 bytecode 的哈希，
+即 keccak256(initialisation_code)=keccak256(abi.encodePacked(type(UniswapV2Pair).creationCode))，这里直接写死。最后得到的哈希被转化为地址 (bytes->uint256->uint160->address)。
+
+```solidity filename="UniswapV2Library.sol"
+// calculates the CREATE2 address for a pair without making any external calls
+function pairFor(address factory, address tokenA, address tokenB) internal pure returns (address pair) {
+    (address token0, address token1) = sortTokens(tokenA, tokenB);
+    pair = address(uint(keccak256(abi.encodePacked(
+            hex'ff',
+            factory,
+            keccak256(abi.encodePacked(token0, token1)),
+            hex'96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f' // init code hash
+        ))));
+}
+```
+
+#### quote
+
+接着看 quote 函数，主要会在添加流动性的时候用到，用来计算给到 reserve 和一种代币的数量时，等价的另一种代币的数量，就是按比例。
+
+```solidity filename="UniswapV2Library.sol"
+// given some amount of an asset and pair reserves, returns an equivalent amount of the other asset
+function quote(uint amountA, uint reserveA, uint reserveB) internal pure returns (uint amountB) {
+    require(amountA > 0, 'UniswapV2Library: INSUFFICIENT_AMOUNT');
+    require(reserveA > 0 && reserveB > 0, 'UniswapV2Library: INSUFFICIENT_LIQUIDITY');
+    amountB = amountA.mul(reserveB) / reserveA;
+}
+```
+
+#### getAmountOut
+
+输入一项资产的数量和 pair 里的储备，计算另外一种资产的最大输出。这个函数跟 V1 里的 `getInputPrice` 基本一样，公式推导也是。
+
+```solidity filename="UniswapV2Library.sol"
+// given an input amount of an asset and pair reserves, returns the maximum output amount of the other asset
+function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) internal pure returns (uint amountOut) {
+    require(amountIn > 0, 'UniswapV2Library: INSUFFICIENT_INPUT_AMOUNT');
+    require(reserveIn > 0 && reserveOut > 0, 'UniswapV2Library: INSUFFICIENT_LIQUIDITY');
+    uint amountInWithFee = amountIn.mul(997);
+    uint numerator = amountInWithFee.mul(reserveOut);
+    uint denominator = reserveIn.mul(1000).add(amountInWithFee);
+    amountOut = numerator / denominator;
+}
+
+```
+
+#### getAmountsOut
+
+这个函数是计算链式兑换中 path 的中间资产和最终资产的数量，比如 path 为 [A,B,C]，则会先将 A 兑换成 B，再将 B 兑换成 C。返回值则是一个数组，第一个元素是 A 的数量，即 amountIn，而第二个元素则是兑换到的代币 B 的数量，最后一个元素则是最终要兑换得到的代币 C 的数量。
+
+从代码中还可看到，每一次兑换其实都调用了 getAmountOut 函数，这也意味着每一次中间兑换都会扣减千分之三的交易手续费。那如果兑换两次，实际支付假设为 1000，那最终实际兑换得到的价值只剩下 994.009，即实际支付的交易手续费将近千分之六了。兑换路径越长，实际扣减的交易手续费会更多，所以兑换路径一般不宜过长。
+
+```solidity filename="UniswapV2Library.sol"
+// performs chained getAmountOut calculations on any number of pairs
+function getAmountsOut(address factory, uint amountIn, address[] memory path) internal view returns (uint[] memory amounts) {
+    require(path.length >= 2, 'UniswapV2Library: INVALID_PATH');
+    amounts = new uint[](path.length);
+    amounts[0] = amountIn;
+    for (uint i; i < path.length - 1; i++) {
+        (uint reserveIn, uint reserveOut) = getReserves(factory, path[i], path[i + 1]);
+        amounts[i + 1] = getAmountOut(amounts[i], reserveIn, reserveOut);
+    }
+}
+
+```
+
+### 路由合约
+
+路由合约是大部分用户用来交互的高层合约。这个合约简化了创建 pair 、添加移除流动性、计算价格以及实际交易的流程，基本就是对 pair 合约的封装。Router 合约也有两个版本，我们直接看 02 即可。
+
+```solidity filename="UniswapV2Router02.sol"
+contract UniswapV2Router02 is IUniswapV2Router02 {
+    using SafeMath for uint;
+
+    address public immutable override factory;
+    address public immutable override WETH;
+
+    modifier ensure(uint deadline) {
+        require(deadline >= block.timestamp, 'UniswapV2Router: EXPIRED');
+        _;
+    }
+
+    constructor(address _factory, address _WETH) public {
+        factory = _factory;
+        WETH = _WETH;
+    }
+
+    receive() external payable {
+        assert(msg.sender == WETH); // only accept ETH via fallback from the WETH contract
+    }
+
+```
+
+可以看到 Router 合约的成员变量只有 factory 地址和 WETH 地址，`receive` 函数确保只有 WETH 能转入 ETH。`ensure` 修饰器确保交易没有过期，下面基本每个函数都要用到。Router 里面有很多地方涉及 ETH 和 WETH 的相互转换，下面我们介绍一下 WETH。
+
+#### WETH
+
+#### 手续费
+
+#### 添加流动性
+
+首先我们来看添加流动性， 注入 ETH 和普通 ERC20 分成了两个函数。
+
+```solidity filename="UniswapV2Router02.sol"
+function _addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin
+    ) internal virtual returns (uint amountA, uint amountB) {
+        // create the pair if it doesn't exist yet
+        if (IUniswapV2Factory(factory).getPair(tokenA, tokenB) == address(0)) {
+            IUniswapV2Factory(factory).createPair(tokenA, tokenB);
+        }
+        (uint reserveA, uint reserveB) = UniswapV2Library.getReserves(factory, tokenA, tokenB);
+        if (reserveA == 0 && reserveB == 0) {
+            (amountA, amountB) = (amountADesired, amountBDesired);
+        } else {
+            uint amountBOptimal = UniswapV2Library.quote(amountADesired, reserveA, reserveB);
+            if (amountBOptimal <= amountBDesired) {
+                require(amountBOptimal >= amountBMin, 'UniswapV2Router: INSUFFICIENT_B_AMOUNT');
+                (amountA, amountB) = (amountADesired, amountBOptimal);
+            } else {
+                uint amountAOptimal = UniswapV2Library.quote(amountBDesired, reserveB, reserveA);
+                assert(amountAOptimal <= amountADesired);
+                require(amountAOptimal >= amountAMin, 'UniswapV2Router: INSUFFICIENT_A_AMOUNT');
+                (amountA, amountB) = (amountAOptimal, amountBDesired);
+            }
+        }
+    }
+
+function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint amountADesired,
+        uint amountBDesired,
+        uint amountAMin,
+        uint amountBMin,
+        address to,
+        uint deadline
+    ) external virtual override ensure(deadline) returns (uint amountA, uint amountB, uint liquidity) {
+        (amountA, amountB) = _addLiquidity(tokenA, tokenB, amountADesired, amountBDesired, amountAMin, amountBMin);
+        address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+        TransferHelper.safeTransferFrom(tokenA, msg.sender, pair, amountA);
+        TransferHelper.safeTransferFrom(tokenB, msg.sender, pair, amountB);
+        liquidity = IUniswapV2Pair(pair).mint(to);
+    }
+
+function addLiquidityETH(
+        address token,
+        uint amountTokenDesired,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) external virtual override payable ensure(deadline) returns (uint amountToken, uint amountETH, uint liquidity) {
+        (amountToken, amountETH) = _addLiquidity(
+            token,
+            WETH,
+            amountTokenDesired,
+            msg.value,
+            amountTokenMin,
+            amountETHMin
+        );
+        address pair = UniswapV2Library.pairFor(factory, token, WETH);
+        TransferHelper.safeTransferFrom(token, msg.sender, pair, amountToken);
+        IWETH(WETH).deposit{value: amountETH}();
+        assert(IWETH(WETH).transfer(pair, amountETH));
+        liquidity = IUniswapV2Pair(pair).mint(to);
+        // refund dust eth, if any
+        if (msg.value > amountETH) TransferHelper.safeTransferETH(msg.sender, msg.value - amountETH);
+    }
+
+```
+
+普通 ERC20 的入口是`addLiquidity`， 参数依次是两个 token 的地址，然后是期望加入的数量，也是上限。`amountAMin` 和 `amountBMin` 是最小值，也就是下限。该值一般是由前端根据预期值和滑点值计算得出的。比如，预期值 amountADesired 为 1000，设置的滑点为 0.5%，那就可以计算得出可接受的最小值 amountAMin 为 1000 \* (1 - 0.5%) = 995。
+最后实际注入的数量是在内部函数 `_addLiquidity` 里计算的。首先如果没有 pair 就创建 pair，如果是首次添加那么就按期望的值创建，否则就依次固定
+两个代币的最大值，然后调用 Library 的 quote 函数，看算出的另外一种代币的数量是否满足下限。最后得出最合适的注入数量后通过`safeTransferFrom`转移代币并分发流动性代币（需要用户提前授权足够额度给 Router）。
+
+`addLiquidityETH` 是和 ETH 配对时调用的入口。跟上面基本一样，只不过函数内部调用了 WETH 的 `deposit`函数将 ETH 转化为 WETH，最后还需将多余的 ETH 退回去。
+
+#### 移除流动性
+
+移除流动性的接口有 6 个：
+
+    1. removeLiquidity：和 addLiquidity 相对应，转入LP token， 换回底层资产
+    2. removeLiquidityETH：和 addLiquidityETH 相对应，换回的其中一种资产是 ETH
+    3. removeLiquidityWithPermit：用户提供签名数据使用 permit 方式完成授权操作
+    4. removeLiquidityETHWithPermit：同上，换回的其中一种资产是 ETH
+    5. removeLiquidityETHSupportingFeeOnTransferTokens：支持转账时支付费用
+    6. removeLiquidityETHWithPermitSupportingFeeOnTransferTokens：功能同上，支持使用链下签名的方式进行授权
+
+`removeLiquidity` 是核心函数，其他几个函数都会调用它。函数很简单，就是找到 pair 之后调用 burn，最后检查下换出来的资产是否达到下限。
+
+```solidity filename="UniswapV2Router02.sol"
+function removeLiquidity(
+    address tokenA,
+    address tokenB,
+    uint liquidity,
+    uint amountAMin,
+    uint amountBMin,
+    address to,
+    uint deadline
+) public virtual override ensure(deadline) returns (uint amountA, uint amountB) {
+    address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+    IUniswapV2Pair(pair).transferFrom(msg.sender, pair, liquidity); // send liquidity to pair
+    (uint amount0, uint amount1) = IUniswapV2Pair(pair).burn(to);
+    (address token0,) = UniswapV2Library.sortTokens(tokenA, tokenB);
+    (amountA, amountB) = tokenA == token0 ? (amount0, amount1) : (amount1, amount0);
+    require(amountA >= amountAMin, 'UniswapV2Router: INSUFFICIENT_A_AMOUNT');
+    require(amountB >= amountBMin, 'UniswapV2Router: INSUFFICIENT_B_AMOUNT');
+}
+```
+
+`removeLiquidityETH`调用了`removeLiquidity`，tokenB 传的是 WETH，并且 to 指向了 Router 合约自己，因为需要将换回来的 WETH 换成 ETH 再打给用户。
+
+```solidity filename="UniswapV2Router02.sol"
+function removeLiquidityETH(
+    address token,
+    uint liquidity,
+    uint amountTokenMin,
+    uint amountETHMin,
+    address to,
+    uint deadline
+) public virtual override ensure(deadline) returns (uint amountToken, uint amountETH) {
+    (amountToken, amountETH) = removeLiquidity(
+        token,
+        WETH,
+        liquidity,
+        amountTokenMin,
+        amountETHMin,
+        address(this),
+        deadline
+    );
+    TransferHelper.safeTransfer(token, to, amountToken);
+    IWETH(WETH).withdraw(amountETH);
+    TransferHelper.safeTransferETH(to, amountETH);
+}
+```
+
+`removeLiquidityWithPermit` 就是在调用的 `removeLiquidity`前使用链下签名调用 `permit` 进行授权，这样用户可以只需一笔交易完成所有操作，节省了 Gas。
+
+```solidity filename="UniswapV2Router02.sol"
+function removeLiquidityWithPermit(
+    address tokenA,
+    address tokenB,
+    uint liquidity,
+    uint amountAMin,
+    uint amountBMin,
+    address to,
+    uint deadline,
+    bool approveMax, uint8 v, bytes32 r, bytes32 s
+) external virtual override returns (uint amountA, uint amountB) {
+    address pair = UniswapV2Library.pairFor(factory, tokenA, tokenB);
+    uint value = approveMax ? uint(-1) : liquidity;
+    IUniswapV2Pair(pair).permit(msg.sender, address(this), value, deadline, v, r, s);
+    (amountA, amountB) = removeLiquidity(tokenA, tokenB, liquidity, amountAMin, amountBMin, to, deadline);
+}
+```
+
+`removeLiquidityETHWithPermit` 大同小异，略过。
+
+`removeLiquidityETHSupportingFeeOnTransferTokens` 主要是为了支持转账时会扣手续费的那种代币。
+
+该函数和 `removeLiquidityETH` 不同点在于：
+
+    * 返回值没有 amountToken；
+    * 调用 removeLiquidity 后也没有 amountToken 值返回
+    * 进行 safeTransfer 时传值直接读取当前地址的 token 余额
+
+都是因为无法知道代币在转账时扣了多少比例的手续费。这里大家可以思考一下为什么必须要带 ETH。
+
+```solidity filename="UniswapV2Router02.sol"
+    function removeLiquidityETHSupportingFeeOnTransferTokens(
+        address token,
+        uint liquidity,
+        uint amountTokenMin,
+        uint amountETHMin,
+        address to,
+        uint deadline
+    ) public virtual override ensure(deadline) returns (uint amountETH) {
+        (, amountETH) = removeLiquidity(
+            token,
+            WETH,
+            liquidity,
+            amountTokenMin,
+            amountETHMin,
+            address(this),
+            deadline
+        );
+        TransferHelper.safeTransfer(token, to, IERC20(token).balanceOf(address(this)));
+        IWETH(WETH).withdraw(amountETH);
+        TransferHelper.safeTransferETH(to, amountETH);
+    }
+```
+
+#### 兑换
+
+兑换是 Uniswap 的核心功能了，因此 Router 也提供了 9 个变种来满足不同条件下的兑换。
+
+    * swapExactTokensForTokens：用指定数量的ERC20兑换ERC20，可以指定换回ERC20的最小值
+    * swapTokensForExactTokens：用一定数量的ERC20兑换指定数量的ERC20，可以指定付出的ERC20的最大值
+    * swapExactETHForTokens：用指定数量的ETH兑换ERC20，可以指定换回ERC20的最小值
+    * swapTokensForExactETH：用一定数量的ERC20兑换指定数量的ETH，可以指定付出的ERC20的最大值
+    * swapExactTokensForETH：用指定数量的ERC20兑换ETH，可以指定换回ETH的最小值
+    * swapETHForExactTokens：用一定数量的ETH兑换指定数量的ERC20，可以指定付出的ETH的最大值
+    * swapExactTokensForTokensSupportingFeeOnTransferTokens：同swapExactTokensForTokens，支持自带转账手续费的代币
+    * swapExactETHForTokensSupportingFeeOnTransferTokens：同swapExactETHForTokens，支持自带转账手续费的代币
+    * swapExactTokensForETHSupportingFeeOnTransferTokens：同swapExactTokensForETH，支持自带转账手续费的代币
+
+```solidity filename="UniswapV2Router02.sol"
+// requires the initial amount to have already been sent to the first pair
+function _swap(uint[] memory amounts, address[] memory path, address _to) internal virtual {
+    for (uint i; i < path.length - 1; i++) {
+        (address input, address output) = (path[i], path[i + 1]);
+        (address token0,) = UniswapV2Library.sortTokens(input, output);
+        uint amountOut = amounts[i + 1];
+        (uint amount0Out, uint amount1Out) = input == token0 ? (uint(0), amountOut) : (amountOut, uint(0));
+        address to = i < path.length - 2 ? UniswapV2Library.pairFor(factory, output, path[i + 2]) : _to;
+        IUniswapV2Pair(UniswapV2Library.pairFor(factory, input, output)).swap(
+            amount0Out, amount1Out, to, new bytes(0)
+        );
+    }
+}
+```
+
+首先我们先来看一下其他几个函数都会用到的这个内部函数`_swap`，传入的是路径 `path`, 和路径上每个节点传入的数量。函数主体就是按照路径循环调用 pair 合约 swap 函数完成底层的兑换操作。所谓路径，就是用一个代币交换另一个代币要通过哪些代币作为中间人，因为有时候两个代币之间并不存在直接的交易对。如果两个代币 A 和 B 兑换，路径就是[A, B]。
+这时候再加入 C，但是 C 并没有和 A 的交易对，但是有和 B 的交易对，那么还是可以进行 A 到 C 的兑换，只不过要先将 A 换成 B，再把 B 换成 C，这时路径就是[A, B ,C ]。
+
+```solidity filename="UniswapV2Router02.sol"
+function swapExactTokensForTokens(
+    uint amountIn,
+    uint amountOutMin,
+    address[] calldata path,
+    address to,
+    uint deadline
+) external virtual override ensure(deadline) returns (uint[] memory amounts) {
+    amounts = UniswapV2Library.getAmountsOut(factory, amountIn, path);
+    require(amounts[amounts.length - 1] >= amountOutMin, 'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT');
+    TransferHelper.safeTransferFrom(
+        path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]
+    );
+    _swap(amounts, path, to);
+}
+```
+
+因为滑点的原因，几乎不可能按照发送交易时的价格完成兑换。所以我们要固定或者输出，才能顺利进行下去。首先来看固定输入的情况，我们调用 `swapExactTokensForTokens`。
+
+比如用 tokenA 兑换 tokenB， amountIn 就是指定支付的 tokenA 的数量，而兑换回来的 tokenB 的数量自然是越多越好，我们只要指定最少需要多少 tokenB （amountOutMin）才能完成交易，path 就是[A,B]。函数内部首先通过 Library 合约的 `getAmountsOut` 拿到所有的输出，
+再检查最后的输出是否达到最低要求，通过的话就把指定数量的 tokenA 转到 pair 合约里。最后调用`_swap`完成 tokenB 的转账。
+
+```solidity filename="UniswapV2Router02.sol"
+function swapTokensForExactTokens(
+    uint amountOut,
+    uint amountInMax,
+    address[] calldata path,
+    address to,
+    uint deadline
+) external virtual override ensure(deadline) returns (uint[] memory amounts) {
+    amounts = UniswapV2Library.getAmountsIn(factory, amountOut, path);
+    require(amounts[0] <= amountInMax, 'UniswapV2Router: EXCESSIVE_INPUT_AMOUNT');
+    TransferHelper.safeTransferFrom(
+        path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amounts[0]
+    );
+    _swap(amounts, path, to);
+}
+```
+
+如果固定输出的话，就调用`swapTokensForExactTokens`，第一个参数变成了指定输出的数量，第二个参数则是最大的输入数量。
+
+接下来四个带 ETH 的函数跟上面两个大同小异，只不过其中一种代币换成了 ETH，就不详述了。
+
+```solidity filename="UniswapV2Router02.sol"
+// requires the initial amount to have already been sent to the first pair
+function _swapSupportingFeeOnTransferTokens(address[] memory path, address _to) internal virtual {
+    for (uint i; i < path.length - 1; i++) {
+        (address input, address output) = (path[i], path[i + 1]);
+        (address token0,) = UniswapV2Library.sortTokens(input, output);
+        IUniswapV2Pair pair = IUniswapV2Pair(UniswapV2Library.pairFor(factory, input, output));
+        uint amountInput;
+        uint amountOutput;
+        { // scope to avoid stack too deep errors
+        (uint reserve0, uint reserve1,) = pair.getReserves();
+        (uint reserveInput, uint reserveOutput) = input == token0 ? (reserve0, reserve1) : (reserve1, reserve0);
+        amountInput = IERC20(input).balanceOf(address(pair)).sub(reserveInput);
+        amountOutput = UniswapV2Library.getAmountOut(amountInput, reserveInput, reserveOutput);
+        }
+        (uint amount0Out, uint amount1Out) = input == token0 ? (uint(0), amountOutput) : (amountOutput, uint(0));
+        address to = i < path.length - 2 ? UniswapV2Library.pairFor(factory, output, path[i + 2]) : _to;
+        pair.swap(amount0Out, amount1Out, to, new bytes(0));
+    }
+}
+function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+    uint amountIn,
+    uint amountOutMin,
+    address[] calldata path,
+    address to,
+    uint deadline
+) external virtual override ensure(deadline) {
+    TransferHelper.safeTransferFrom(
+        path[0], msg.sender, UniswapV2Library.pairFor(factory, path[0], path[1]), amountIn
+    );
+    uint balanceBefore = IERC20(path[path.length - 1]).balanceOf(to);
+    _swapSupportingFeeOnTransferTokens(path, to);
+    require(
+        IERC20(path[path.length - 1]).balanceOf(to).sub(balanceBefore) >= amountOutMin,
+        'UniswapV2Router: INSUFFICIENT_OUTPUT_AMOUNT'
+    );
+}
+```
+
+最后讲一下转账带手续费的情况，跟之前的不一样的是，每一步的实际输入都无法确定，所以需要每次计算前再通过`balanceOf` 拿一次实际到账的数量。
+
+### 闪电兑
+
+### 流动性挖矿
+
+## 前端
+
+## 部署
+
+原版部署
+
+## 参考
+
+https://uniswap.org/whitepaper.pdf
+https://hackmd.io/@adshao/HkZwPZNf9
+https://hackmd.io/@adshao/rk7nI-EG9

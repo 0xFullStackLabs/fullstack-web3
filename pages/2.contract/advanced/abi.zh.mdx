@@ -1,0 +1,28 @@
+# ABI
+
+
+https://medium.com/@0xdeadbeef0x/the-double-edged-sword-of-abi-decode-f81529e62bcc
+
+
+When to use abi.encode, abi.encodePacked or abi.encodeWithSignature in solidity
+This depends what you require and what you want to ensure.
+
+abi.encode will apply ABI encoding rules. Therefore all elementary types are padded to 32 bytes and dynamic arrays include their length. Therefore it is possible to also decode this data again (with abi.decode) when the type are known.
+
+abi.encodePacked will only use the minimal required memory to encode the data. E.g. an address will only use 20 bytes and for dynamic arrays only the elements will be stored without length. For more info see the Solidity docs for packed mode.
+
+For the input of the keccak method it is important that you can ensure that the resulting bytes of the encoding are unique. So if you always encode the same types and arrays always have the same length then there is no problem. But if you switch the parameters that you encode or encode multiple dynamic arrays you might have conflicts.
+
+For example:
+
+abi.encodePacked(address(0x0000000000000000000000000000000000000001), uint(0)) encodes to the same as abi.encodePacked(uint(0x0000000000000000000000000000000000000001000000000000000000000000), address(0))
+
+and
+
+abi.encodePacked(uint[](1,2), uint[](3)) encodes to the same as abi.encodePacked(uint[](1), uint[](2,3))
+
+Therefore these examples will also generate the same hashes even so they are different inputs.
+
+On the other hand you require less memory and therefore in most cases abi.encodePacked uses less gas than abi.encode.
+
+abi.encodePacked should stop to be used since there are conversions around to deprecate it in future versions of Solidity

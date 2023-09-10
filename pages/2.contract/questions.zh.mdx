@@ -1,0 +1,332 @@
+# 练习问题
+
+
+## 以太坊和Solidity
+继承体系中初始化顺序
+
+New order:
+
+    All state variables are zero-initialized at the beginning.
+
+    Evaluate base constructor arguments from most derived to most base contract.
+
+    For every contract in order from most base to most derived in the linearized hierarchy:
+
+            Initialize state variables.
+
+            Run the constructor (if present).
+
+This causes differences in contracts where the initial value of a state variable relies on the result of the constructor in another contract:
+
+open in Remix
+
+```solidity
+// SPDX-License-Identifier: GPL-3.0
+pragma solidity >=0.7.1;
+
+contract A {
+    uint x;
+    constructor() {
+        x = 42;
+    }
+    function f() public view returns(uint256) {
+        return x;
+    }
+}
+contract B is A {
+    uint public y = f();
+}
+```
+
+Previously, y would be set to 0. This is due to the fact that we would first initialize state variables: First, x is set to 0, and when initializing y, f() would return 0 causing y to be 0 as well. With the new rules, y will be set to 42. We first initialize x to 0, then call A’s constructor which sets x to 42. Finally, when initializing y, f() returns 42 causing y to be 42.
+
+
+继承体系中内存排布
+
+Multiple, contiguous items that need less than 32 bytes are packed into a single storage slot if possible, according to the following rules:
+
+    The first item in a storage slot is stored lower-order aligned.
+
+    Value types use only as many bytes as are necessary to store them.
+
+    If a value type does not fit the remaining part of a storage slot, it is stored in the next storage slot.
+
+    Structs and array data always start a new slot and their items are packed tightly according to these rules.
+
+    Items following struct or array data always start a new storage slot.
+
+For contracts that use inheritance, the ordering of state variables is determined by the C3-linearized order of contracts starting with the most base-ward contract. If allowed by the above rules, state variables from different contracts do share the same storage slot.
+
+
+
+
+coantract size 
+
+
+### What is the difference between create and create2?
+
+The main differences between create and create2 in Solidity are:
+
+create2 generates an address deterministically based on the address of the deployer, a salt, and the initialization code. create generates addresses randomly.
+create2 addresses can be pre-computed before deploying the contract. create addresses can only be known after deploying.
+create2 uses keccak256 hash for computing the contract address. create uses the RLP encoding of the contract creation code.
+create2 consumes more gas than create since it does extra computing to generate the address.
+create2 allows deploying to known addresses which enables address reuse, planning external calls, and saves gas.
+create2 prevents front-running of contract deployment that is possible with create.
+In summary:
+
+create2 generates deterministic contract addresses while create uses randomness.
+create2 allows pre-computing and reusing addresses saving gas and preventing front-running attacks.
+create is a bit cheaper to use regarding deployment gas costs.
+So create2 provides more predictability and customization for advanced use cases, while create is a bit simpler and cheaper.
+
+Address Collision Avoidance: create2 helps prevent address collisions by allowing developers to choose a salt value. This avoids potential conflicts that can occur with create when multiple contracts are created by the same contract in the same block.
+Storage Reuse: create2 can be used to deploy a contract to an existing address. This allows for the reuse of storage slots and potentially reduces gas costs in certain scenarios.
+
+It's important to note that create2 is a more advanced feature and may not be necessary for most smart contract deployments. However, it can be useful in specific cases where address determinism or address reuse is required.
+
+
+### What major change with arithmetic happened with Solidity 0.8.0?
+Starting from Solidity 0.8.0, arithmetic operations on integer types (uint and int) now trigger an exception when an overflow or underflow occurs. This means that if an overflow or underflow situation is encountered during an arithmetic operation, a runtime exception will be thrown, and the transaction will revert.
+
+### What are the challenges of creating a random number on the blockchain?
+There are a few key challenges with generating random numbers on the blockchain:
+
+Deterministic execution - Blockchains are deterministic systems where each node must be able to verify execution. Traditional randomness relies on unpredictable factors like timing or hardware noise which is difficult to achieve.
+Manipulation and bias - Numbers should be unbiased and unable to be manipulated by miners/validators. But parties with control of blocks can potentially influence naive randomness schemes.
+Public verifiability - Random numbers must be verifiably random to all parties. Numbers should not be chosen arbitrarily by a single node or group.
+Seeding - Good random number generation requires quality entropy for seeding. This is difficult when all blockchain activity is public.
+Gas costs - True randomness requires off-chain oracle solutions which can be expensive gas-wise compared to on-chain algorithms.
+So in summary, the challenges are introducing unpredictability and entropy into a deterministic system, avoiding manipulation/bias, verifying to all parties, securing good seeds, and managing gas costs.
+
+Common solutions include leveraging block hashes as a source of "pseudo-randomness", using multiple block variables to increase entropy, incorporating trusted off-chain oracles, and designing economic incentives around manipulation resistance.
+
+### How to get a random number on the blockchain?
+Block Hashes: You can use the hash of the current or previous block as a source of randomness. For example, you can concatenate the block hash with other input data and hash it again to generate a random number. However, be cautious as miners have some control over the block hash and may attempt to manipulate it.
+
+Timestamps: You can use the timestamp of the current block as a source of randomness. However, keep in mind that timestamps can be manipulated by miners to some extent.
+
+External Oracles: You can rely on external oracles or off-chain services that provide random numbers. These oracles can provide randomness by leveraging various sources such as hardware entropy, network events, or randomness beacons. However, it's important to ensure the trustworthiness and security of the chosen oracle.
+
+Commit-Reveal Scheme: In a commit-reveal scheme, participants commit to a hidden value, such as a random number, and later reveal their committed values. By combining and hashing the revealed values, a random number can be generated. This approach enables participants to contribute their randomness while preventing manipulation.
+
+Randomness Providers: There are specialized services or protocols, such as Chainlink VRF (Verifiable Random Function), that provide secure and verifiable random numbers on the blockchain. These services utilize a decentralized network of oracles to generate random numbers that can be publicly verified.
+
+When implementing a random number generation mechanism, it's crucial to consider the specific requirements, security concerns, and trust assumptions of your application. Evaluating the trade-offs and potential risks associated with each method is essential to ensure the integrity and fairness of your system.
+
+
+### What is the check-effects pattern?
+Check Phase: In the check phase, the function performs all the necessary checks and validations without modifying any state variables. This includes verifying conditions, checking permissions, validating inputs, and performing any other required checks. The check phase ensures that the function is executed only if the necessary conditions are met.
+
+Effects Phase: In the effects phase, after the necessary checks have been performed, the function modifies the state variables or performs actions that have an impact on the contract's state. This can include updating balances, transferring tokens, changing ownership, or any other state-changing operations.
+
+The check-effects pattern helps improve the security and reliability of smart contracts by separating the concerns of checking conditions and modifying state. By clearly separating these phases, it becomes easier to reason about the contract's behavior, identify potential vulnerabilities, and ensure that state modifications are performed only under the correct conditions.
+
+### What is the difference between fallback and receive?
+
+The key differences between fallback and receive functions in Solidity are:
+
+Fallback can handle both empty calldata and ether sent, receive can only handle ether
+Contracts can have at most one of each function
+Fallback must be marked external, receive must be marked external payable
+Receive function is called if msg.data is empty, fallback if not
+Receive takes precedence over fallback if both defined
+
+### What is the difference between view and pure?
+
+The main differences between view and pure functions in Solidity are:
+
+view - Reads state but does not modify state
+pure - Does not read or modify state
+Some key points:
+
+view functions promise to not modify the state. But they can read the blockchain state and return values based on that.
+pure functions promise to not read or modify the state. They only operate on their arguments.
+pure allows for gas optimization, since function calls can be replaced at compile time if inputs are known.
+view prevents gas optimization since state reads could return different values.
+Both view and pure will revert if they try to modify state.
+
+
+### What is the difference between transfer and send? Why should they not be used?
+transfer: The transfer method is a built-in function available on all addresses in Solidity. It allows you to send Ether to another address and is considered to be the safer option of the two. If the transfer fails (e.g., due to an out-of-gas error or a failed assertion), it will revert the entire transaction, rolling back any state changes made prior to the transfer.
+
+send: The send method is an older, lower-level method for sending Ether that was available prior to Solidity version 0.4.0. It returns a boolean value indicating whether the transfer was successful or not. If the transfer fails, it returns false instead of reverting the transaction. This means that if you use send and don't explicitly handle the return value, the failure of the transfer will not revert the transaction, potentially leaving your contract in an inconsistent state.
+
+Both transfer and send have a gas limit of 2,300 gas, which is a relatively low amount. This gas limit can be problematic in scenarios where the receiving address executes a fallback function that requires more gas, such as when interacting with complex contracts or making multiple external calls. In such cases, the transfer or send may fail, and the transaction may revert, resulting in a loss of Ether.
+Instead of using transfer or send, it is generally recommended to use the address.call method with a specified gas limit. This allows you to control the amount of gas allocated to the call and handle the return value appropriately.
+
+
+### How do you write a gas-efficient for loop in Solidity?
+Use uint for loop counters instead of integer types like int or int256. uint is cheaper.
+Declare the loop counter variable outside the loop if possible, to avoid repeating memory allocation costs.
+Cache array lengths instead of calling array.length in each iteration.
+Avoid memory arrays if you can - they are expanded dynamically and cost more gas.
+Increment counters manually instead of using ++. The ++ operator compiles to a SLOAD and SSTORE which are expensive.
+Be careful with delete inside loops as it costs extra gas. Set variables to 0 instead if possible.
+Avoid function calls inside loops. They can lead to unexpected gas costs.
+If iterating storage arrays, read from storage once into a memory variable and iterate that instead.
+Consider Iterating in Reverse: If the order of iteration doesn't matter, consider iterating in reverse. In some cases, iterating in reverse can reduce gas costs as it may allow the optimizer to optimize certain operations more effectively.
+Use Inline Assembly to avoid checks
+
+### What is the difference between abi.encode and abi.encodePacked?
+abi.encode:
+
+Encodes data according to ABI specification
+Supports tuple encoding
+Allows encoding nested arrays and structs
+Uses variable-length types like string and bytes
+Allows encoding types like address
+abi.encodePacked:
+
+Encodes data tightly packed without padding
+Does not allow tuple encoding
+Only supports elementary types like uint, int, bool
+Does not allow nested arrays or structs
+Uses fixed-size byte arrays instead of string/bytes
+Cannot encode variable-length types like addresses
+In summary:
+
+abi.encode follows the ABI standard and supports more types
+abi.encodePacked tightly packs data but has fewer types
+abi.encode is more flexible and supports complex types. abi.encodePacked is more gas efficient for packing elemental types.
+
+In general, abi.encode is the recommended option for encoding function parameters or data structures, as it provides type information and alignment guarantees. abi.encodePacked is typically used when you need to manually concatenate raw data without any additional information or alignment requirements.
+
+
+### What is the difference between abi.decode and abi.decodePacked?
+The abi.decode and abi.decodePacked functions in Solidity are used to decode encoded data into their original types. The main difference between the two functions lies in how the data is expected to be encoded.
+
+abi.decode: The abi.decode function is used to decode encoded data that follows the standard ABI encoding rules. The data needs to be encoded using the abi.encode or abi.encodeWith* functions, which include padding and type information. abi.decode takes the encoded data and a list of expected types as arguments and returns the decoded values.
+Here's an example of using abi.decode:
+
+bytes memory encodedData = abi.encode(true, 42, "Hello");
+(bool decodedBool, uint256 decodedUint, string memory decodedString) = abi.decode(encodedData, (bool, uint256, string));
+In this example, the encodedData is decoded using abi.decode, and the expected types (bool, uint256, string) are provided as the second argument. The decoded values are assigned to individual variables (decodedBool, decodedUint, decodedString).
+
+abi.decodePacked: The abi.decodePacked function is used to decode tightly packed or raw encoded data. It assumes that the data is not padded and does not contain type information. It simply takes the encoded data and a list of expected types as arguments and returns the decoded values.
+Here's an example of using abi.decodePacked:
+
+bytes memory packedData = abi.encodePacked(true, 42, "Hello");
+(bool decodedBool, uint256 decodedUint, string memory decodedString) = abi.decodePacked(packedData, (bool, uint256, string));
+In this example, the packedData (which was generated using abi.encodePacked) is decoded using abi.decodePacked, and the expected types (bool, uint256, string) are provided as the second argument. The decoded values are assigned to individual variables (decodedBool, decodedUint, decodedString).
+
+To summarize, abi.decode is used to decode data that follows the standard ABI encoding rules, while abi.decodePacked is used to decode tightly packed or raw encoded data without padding or type information.
+
+
+### If a delegatecall is made to a function that reads from an immutable variable, what will the value be?
+https://stackoverflow.com/questions/70971068/issues-using-a-delegatecall-proxy-contract-with-solidity-and-using-variables-i
+
+
+### What changed with block.timestamp before and after proof of stake?
+
+Before the transition to Proof of Stake (PoS), the block.timestamp in Ethereum represented the timestamp of the current block. It provided the approximate time at which the block was mined by the Ethereum network's Proof of Work (PoW) consensus algorithm. The timestamp was based on the miner's system clock and was subject to some variance.
+
+However, with the transition to Ethereum 2.0 and the adoption of Proof of Stake, the concept of block.timestamp has changed. In Ethereum 2.0, the network no longer relies on PoW mining to validate and timestamp blocks. Instead, it uses a PoS consensus algorithm.
+
+In the context of Ethereum 2.0, block.timestamp now represents the timestamp of the "slot" in which the block was proposed, rather than the time the block was actually validated or added to the blockchain. A "slot" is a fixed time interval in the Ethereum 2.0 PoS protocol, and each slot has a designated validator responsible for proposing a block.
+
+It's important to note that the slot time in Ethereum 2.0 is currently set to 12 seconds, but it may change in future upgrades. Therefore, block.timestamp in Ethereum 2.0 represents the time at which the slot was proposed, which is more deterministic and less subject to variance compared to the PoW-based block.timestamp in Ethereum 1.0.
+
+
+### Under what circumstances could abi.encodePacked create a vulnerability?
+Misalignment: When using abi.encodePacked, it's important to ensure that the data being packed is properly aligned. If the data is not aligned correctly, it can lead to unexpected behavior or errors when accessing the packed data. Misalignment can occur if the data being packed has specific alignment requirements, such as when packing structs with different data types.
+
+Gas Usage: abi.encodePacked concatenates the raw encoded values without adding any padding or separators. While this can be more gas-efficient, it can result in higher gas costs if the packed data is subsequently accessed or manipulated. For example, if you need to access a particular value within the packed data, you would need to perform additional operations to extract the desired value.
+
+Hash Collisions: When using abi.encodePacked for hashing purposes, such as when calculating unique identifiers or checking for data integrity, there is a risk of hash collisions. Hash collisions occur when two different inputs produce the same hash output. Attackers can exploit hash collisions to manipulate data or cause unexpected behavior in the application.
+
+Type Safety: abi.encodePacked does not perform type checking or validation of the data being packed. This means that if the data types are not properly handled or interpreted on the receiving side, it can lead to type-related vulnerabilities such as overflow, underflow, or incorrect data interpretation.
+
+To mitigate these vulnerabilities, consider the following best practices:
+
+Ensure proper alignment and handling of the packed data.
+Be mindful of the gas costs and consider the trade-offs between gas efficiency and code readability.
+Use appropriate hashing algorithms and consider additional measures to prevent hash collisions.
+Validate and interpret the packed data correctly on the receiving side.
+
+### What is the free memory pointer and where is it stored?
+In Solidity, the "free memory pointer" (often referred to as free memory pointer or free mem ptr) is a special pointer that keeps track of the next available memory location for dynamic memory allocation. It indicates the location in memory where new data can be stored without overwriting existing data. 
+0x40
+
+
+### What function modifiers are valid for interfaces?
+view and pure It's important to note that function modifiers like external, internal, payable, or custom modifiers are not valid for interfaces. Interfaces are used to define the external-facing functions of a contract, and they only declare the function signatures without any implementation details or modifiers beyond view or pure.
+
+
+
+### What is the difference between memory and calldata in a function argument?
+memory is a temporary storage location used for variables that are created and destroyed during function execution.
+When you pass a function argument with the memory keyword, a new copy of the data is created and stored in memory for the duration of the function call.
+You can read from and write to memory variables within the function, and any changes made to memory variables are not persisted outside the function scope.
+Examples of memory usage include creating and manipulating arrays, strings, and structs within a function.
+Calldata:
+
+calldata is a special storage location that contains the function arguments and data sent when calling a function from outside the contract.
+Function arguments declared with the calldata keyword are read-only and cannot be modified within the function.
+calldata is primarily used for accessing input data and arguments from external function calls.
+Using calldata instead of memory for function arguments can save gas costs since it avoids unnecessary data copying.
+It's important to note that modifications to variables declared as calldata are not allowed and will result in a compilation error.
+
+### Describe the three types of storage gas costs.
+SLOAD and SSTORE Refunds
+
+
+### What is the difference between UUPS and the Transparent Upgradeable Proxy pattern?
+https://docs.openzeppelin.com/contracts/4.x/api/proxy#transparent-vs-uups
+
+### If a contract delegatecalls an empty address or an implementation that was previously self-destructed, what happens? What if it is a regular call instead of a delegatecall?
+Delegatecall to an Empty Address:
+
+When a contract performs a delegatecall to an empty address (0x000…), the call will still be executed, but since there is no code at the target address, the execution will return false, indicating a failed call.
+The contract making the delegatecall will continue executing its own code after the call, unaffected by the empty address call.
+It's important to note that the state of the contract, including storage and balances, will remain unchanged as a result of the failed delegatecall.
+Delegatecall to a Self-Destructed Contract:
+
+If a contract performs a delegatecall to an implementation contract that was previously self-destructed, the call will still be executed, but again, since there is no code at the target address, the execution will return false, indicating a failed call.
+Similar to calling an empty address, the contract making the delegatecall will continue executing its own code after the call, and the state of the contract will remain unchanged.
+Regular Call to an Empty Address:
+
+When a contract performs a regular call to an empty address, the call will revert immediately without any further execution.
+The contract making the call will not continue executing its own code after the failed call.
+Since the call reverts, any state changes made before the call will be reverted as well.
+Regular Call to a Self-Destructed Contract:
+
+If a contract performs a regular call to an implementation contract that was previously self-destructed, the call will revert immediately without any further execution.
+The contract making the call will not continue executing its own code after the failed call.
+Similar to calling an empty address, any state changes made before the call will be reverted.
+
+### What danger do ERC777 tokens pose?
+
+https://mixbytes.io/blog/one-more-problem-with-erc777#:~:text=However%2C%20these%20additional%20calls%20during,security%20risk%20to%20such%20contracts.
+
+### How does safeMint differ from mint in the OpenZeppelin ERC721 implementation? 
+In addition to creating and assigning a new token, the safeMint function checks whether the recipient address is a valid ERC721 receiver contract by calling the onERC721Received function on that contract.
+The safeMint function also checks whether the token ID is unique before minting the token, preventing the minting of duplicate tokens.
+
+### If a delegatecall is made to a function that reverts, what does the delegatecall do?
+delegatecall from an External Contract: If an external contract performs a delegatecall to a function that reverts, the delegatecall will continue executing the code in the target contract. However, the delegatecall itself will not revert. Instead, it will return false, indicating a failed call. The calling contract can handle the failed call and continue its execution.
+
+delegatecall from the Same Contract: If the same contract performs a delegatecall to a function that reverts, the delegatecall will propagate the revert and cause the calling contract to revert as well. The entire execution of the calling contract will be reverted, including any state changes made before the delegatecall.
+
+### What is ERC165 used for?
+Interface ID: Each interface or capability that a contract supports is associated with a unique 4-byte interface ID. The interface ID is calculated using the XOR of the function selectors of all the functions in the interface.
+
+SupportsInterface: The supportsInterface function is defined by ERC165 and is used to check if a contract supports a specific interface. It takes an interface ID as an argument and returns a boolean indicating whether the interface is supported.
+
+By conforming to ERC165, contracts can provide a standardized way for others to query their capabilities, making it easier to build interoperable smart contracts and systems. It enhances composability, reduces the risk of incompatible interactions, and promotes code reusability.
+
+
+### If a proxy makes a delegatecall to A, and A does address(this).balance, whose balance is returned, the proxy's or A?
+When a proxy contract makes a delegatecall to contract A, and contract A executes address(this).balance, the balance returned will be the balance of the proxy contract, not contract A.
+
+Here's why:
+
+delegatecall preserves the context of the calling contract, including the storage and balance.
+In a delegatecall, the code of contract A is executed within the context of the proxy contract. This means that address(this) in contract A refers to the proxy contract, not contract A itself.
+Therefore, when address(this).balance is executed within contract A via a delegatecall, it returns the balance of the proxy contract, not the balance of contract A.
+
+
+### What does ERC721A do to reduce mint costs? What is the tradeoff?
+
+
+https://hackmd.io/@adshao/SywHLDdq9
